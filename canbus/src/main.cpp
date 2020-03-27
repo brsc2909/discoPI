@@ -1,68 +1,330 @@
 #include <Arduino.h>
-#include <SPI.h>
-#include <mcp_can.h>
+#include <mcp2515_defs.h>
+#include <mcp2515.h>
+#include <defaults.h>
+#include <global.h>
+#include <Canbus.h>
 #include <SoftwareSerial.h>
+
+#define LED_PIN 13
+
+#define CMD_LEN (sizeof("T12345678811223344556677881234\r")+1)
+
+int g_can_speed = CANSPEED_500; // default: 500k
+int g_ts_en = 0;
+
 
 #define SP2_RX 8
 #define SP2_TX 9
 
 SoftwareSerial RPISerial(SP2_RX, SP2_TX); // 2 is RX, 3 is TX
 
-const int spiCSPin = 10;
-const int ledPin = 13;
-boolean ledON = 1;
-
-MCP_CAN CAN(spiCSPin);
-unsigned long time;
-
 void setup()
 {
     Serial.begin(115200);
     RPISerial.begin(115200);
+    RPISerial.println("Serial initialized.");
 
-    pinMode(ledPin,OUTPUT);
-
-    while (CAN_OK != CAN.begin(CAN_500KBPS))
+    while (!Canbus.init(g_can_speed))
     {
         Serial.println("CAN BUS Init Failed");
-        RPISerial.println("CAN BUS Init Failed");
-        delay(100);
+        delay(1000);
     }
     Serial.println("CAN BUS  Init OK!");
-    RPISerial.println("CAN BUS  Init OK!");
 }
 
-void relayCANMessage( unsigned char canId, unsigned char len, unsigned char *canMessage){
-        RPISerial.write(0xAA);
-        RPISerial.write(millis());
-        RPISerial.write(len);
-        RPISerial.write(canId);
-        RPISerial.write(canMessage, len);
-        RPISerial.write(0xBB);
-}
-
-void relayCANMessage2( unsigned char canId, unsigned char len, unsigned char *canMessage){
-        Serial.write(0xAA);
-        Serial.write(millis());
-        Serial.write(len);
-        Serial.write(canId);
-        Serial.write(canMessage, len);
-        Serial.write(0xBB);
-}
-
-void loop()
+int b2ahex(char *p, uint8_t s, uint8_t n, void *v)
 {
- 
-    unsigned char len = 0;
-    unsigned char buf[8];
+  const char *hex = "0123456789ABCDEF";
 
-    if(CAN_MSGAVAIL == CAN.checkReceive())
-    {
-        CAN.readMsgBuf(&len, buf);
-
-        unsigned long canId = CAN.getCanId();
-        relayCANMessage(canId, len, buf);
-        relayCANMessage2(canId, len, buf);
-
+  if (s == 1) {
+    uint8_t *tmp = (uint8_t *)v;
+    for (int i=0; i<n; i++) {
+      *p++ = hex[tmp[i] & 0x0f];
     }
+  } else if (s == 2) {
+    uint8_t *tmp = (uint8_t *)v;
+    for (int i=0; i<n; i++) {
+      *p++ = hex[(tmp[i] >> 4) & 0x0f];
+      *p++ = hex[tmp[i] & 0x0f];
+    }
+  } else if (s == 3) {
+    uint16_t *tmp = (uint16_t *)v;
+    for (int i=0; i<n; i++) {
+      *p++ = hex[(tmp[i] >> 8) & 0x0f];
+      *p++ = hex[(tmp[i] >> 4) & 0x0f];
+      *p++ = hex[tmp[i] & 0x0f];
+    }
+  } else if (s == 4) {
+    uint16_t *tmp = (uint16_t *)v;
+    for (int i=0; i<n; i++) {
+      *p++ = hex[(tmp[i] >> 12) & 0x0f];
+      *p++ = hex[(tmp[i] >> 8) & 0x0f];
+      *p++ = hex[(tmp[i] >> 4) & 0x0f];
+      *p++ = hex[tmp[i] & 0x0f];
+    }
+  }
+  return s*n;
+}
+
+int a2bhex_sub(char a)
+{
+  int val = 0;
+
+  if ('0' <= a && a <= '9') {
+    val = a - '0';
+  } else if ('A' <= a && a <= 'F') {
+    val = a - 'A' + 10;
+  } else if ('a' <= a && a <= 'f') {
+    val = a - 'a' + 10;
+  }
+  return val;
+}
+
+int a2bhex(char *p, uint8_t s, uint8_t n, void *v)
+{
+  int i, j;
+  int val;
+
+  if (s == 1 || s == 2)  {
+    uint8_t *tmp = (uint8_t *)v;
+    for (i=0; i<n; i++) {
+      val = 0;
+      for (j=0; j<s; j++) {
+        val = (val << 4) | a2bhex_sub(*p++);
+      }
+      *tmp++ = val;
+    }
+  } else if (s == 3 || s == 4) {
+    uint16_t *tmp = (uint16_t *)v;
+    for (i=0; i<n; i++) {
+      val = 0;
+      for (j=0; j<s; j++) {
+        val = (val << 4) | a2bhex_sub(*p++);
+      }
+      *tmp++ = val;
+    }
+  }
+  return n;
+}
+
+// transfer messages from CAN bus to host
+void xfer_can2tty()
+{
+  tCAN msg;
+  char buf[CMD_LEN];
+  static uint16_t ts = 0;
+  char *p;
+  uint8_t len;
+
+  while (Canbus.message_rx(&msg)) {
+    p = buf;
+    if (msg.header.ide) {
+      if (msg.header.rtr) {
+        *p++ = 'R';
+      } else {
+        *p++ = 'T';
+      }
+      p += b2ahex(p, 4, 1, &msg.id);
+      p += b2ahex(p, 4, 1, &msg.ide);
+      len = msg.header.length % 10;
+      p += b2ahex(p, 1, 1, &len);
+    } else {
+      if (msg.header.rtr) {
+        *p++ = 'r';
+      } else {
+        *p++ = 't';
+      }
+      p += b2ahex(p, 3, 1, &msg.id);
+      len = msg.header.length;
+      p += b2ahex(p, 1, 1, &len);
+    }
+
+    p += b2ahex(p, 2, msg.header.length, msg.data);
+
+    // insert timestamp if needed
+    if (g_ts_en) {
+      p += b2ahex(p, 4, 1, &ts); // up to 60,000ms
+      ts++;
+    }
+
+    *p++ = '\r';
+    *p++ = '\0';
+    RPISerial.print(buf);
+  }
+}
+
+void slcan_ack()
+{
+  RPISerial.write('\r'); // ACK
+}
+
+void slcan_nack()
+{
+  RPISerial.write('\a'); // NACK
+}
+
+void send_canmsg(char *buf)
+{
+  tCAN msg;
+  int len = strlen(buf) - 1;
+  uint16_t id[2];
+  uint8_t hlen;
+  int is_eff = buf[0] & 0x20 ? 0 : 1;
+  int is_rtr = buf[0] & 0x02 ? 1 : 0;
+
+  if (!is_eff && len >= 4) { // SFF
+    a2bhex(&buf[1], 3, 1, id);
+    msg.id = id[0];
+    msg.header.rtr = is_rtr;
+    msg.header.ide = 0;
+    a2bhex(&buf[4], 1, 1, &hlen);
+    msg.header.length = hlen;
+    if (len - 4 - 1 == msg.header.length * 2) {
+      a2bhex(&buf[5], 2, msg.header.length, msg.data);
+      while (!Canbus.message_tx(&msg)) ;
+    }
+
+  } else if (is_eff && len >= 9) { // EFF
+    a2bhex(&buf[1], 4, 2, id);
+    msg.id = id[0] & 0x1fff;
+    msg.ide = id[1];
+    msg.header.rtr = is_rtr;
+    msg.header.ide = 1;
+    a2bhex(&buf[9], 1, 1, &hlen);
+    msg.header.length = hlen;
+    if (len - 9 - 1 == msg.header.length * 2) {
+      a2bhex(&buf[10], 2, msg.header.length, msg.data);
+      while (!Canbus.message_tx(&msg)) ;
+    }
+  }
+}
+
+void pars_slcancmd(char *buf)
+{
+  switch (buf[0]) {
+    // common commands
+    case 'O': // open channel
+      if (Canbus.init(g_can_speed)) {
+        Serial.print("Canbus initialized: ");
+        Serial.print(g_can_speed);
+        Serial.println("KBPS");
+      } else {
+        Serial.println("Canbus initialization Failed.");
+      }
+      slcan_ack();
+      break;
+    case 'C': // close channel
+      Serial.println("Canbus Closed.");
+      slcan_ack();
+      break;
+    case 't': // SFF
+    case 'T': // EFF
+    case 'r': // RTR/SFF
+    case 'R': // RTR/EFF
+      send_canmsg(buf);
+      slcan_ack();
+      break;
+    case 'Z': // turn timestamp on/off
+      if (buf[1] == '0') {
+        g_ts_en = 0;
+      } else if (buf[1] == '1') {
+        g_ts_en = 1;
+      } else {
+        slcan_nack();
+      }
+      slcan_ack();
+      break;
+    case 'M': // acceptance mask
+      slcan_ack();
+      break;
+    case 'm': // acceptance value
+      slcan_ack();
+      break;
+
+    // non-standard commands
+    case 'S': // setup CAN bit-rates
+      switch (buf[1]) {
+        case '0': // 10k
+        case '1': // 20k
+        case '2': // 50k
+          slcan_nack();
+          break;
+        case '3': // 100k
+          g_can_speed = CANSPEED_100;
+          slcan_ack();
+          break;
+        case '4': // 125k
+          g_can_speed = CANSPEED_125;
+          slcan_ack();
+          break;
+        case '5': // 250k
+          g_can_speed = CANSPEED_250;
+          slcan_ack();
+          break;
+        case '6': // 500k
+          g_can_speed = CANSPEED_500;
+          slcan_ack();
+          break;
+        case '7': // 800k
+          slcan_nack();
+          break;
+        case '8': // 1000k
+          g_can_speed = CANSPEED_1000;
+          slcan_ack();
+          break;
+        default:
+          slcan_nack();
+          break;
+      }
+      break;
+    case 's': // directly set bitrate register of mcp2515
+      slcan_nack();
+      break;
+    case 'F': // status flag
+      RPISerial.print("F12");
+      slcan_ack();
+      break;
+    case 'V': // hw/sw version
+      RPISerial.print("V1234");
+      slcan_ack();
+      break;
+    case 'N': // serial number
+      RPISerial.print("N1234");
+      slcan_ack();
+      break;
+    default: // unknown command
+      slcan_nack();
+      break;
+  }
+}
+
+// transfer messages from host to CAN bus
+void xfer_tty2can()
+{
+  int length;
+  static char cmdbuf[CMD_LEN];
+  static int cmdidx = 0;
+
+  if ((length = RPISerial.available()) > 0) {
+    for (int i = 0; i < length; i++) {
+      char val = RPISerial.read();
+      cmdbuf[cmdidx++] = val;
+
+      if (cmdidx == CMD_LEN) { // command is too long
+        slcan_nack();
+        cmdidx = 0;
+      } else if (val == '\r') { // end of command
+        cmdbuf[cmdidx] = '\0';
+        pars_slcancmd(cmdbuf);
+        cmdidx = 0;
+      }
+    }
+  }
+}
+
+// the loop function runs over and over again forever
+void loop() {
+  xfer_can2tty();
+  xfer_tty2can();
 }
